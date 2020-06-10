@@ -20,6 +20,7 @@ __all__ = (
     'mock_open',
     'PropertyMock',
     'seal',
+    'CallEvent'
 )
 
 
@@ -30,6 +31,7 @@ import inspect
 import pprint
 import sys
 import builtins
+import threading
 from asyncio import iscoroutinefunction
 from types import CodeType, ModuleType, MethodType
 from unittest.util import safe_repr
@@ -219,6 +221,7 @@ def _setup_func(funcopy, mock, sig):
             ret.reset_mock()
 
     funcopy.called = False
+    funcopy.call_event = CallEvent(mock)
     funcopy.call_count = 0
     funcopy.call_args = None
     funcopy.call_args_list = _CallList()
@@ -441,6 +444,7 @@ class NonCallableMock(Base):
         __dict__['_mock_delegate'] = None
 
         __dict__['_mock_called'] = False
+        __dict__['_mock_call_event'] = CallEvent(self)
         __dict__['_mock_call_args'] = None
         __dict__['_mock_call_count'] = 0
         __dict__['_mock_call_args_list'] = _CallList()
@@ -542,6 +546,7 @@ class NonCallableMock(Base):
         return self._spec_class
 
     called = _delegating_property('called')
+    call_event = _delegating_property('call_event')
     call_count = _delegating_property('call_count')
     call_args = _delegating_property('call_args')
     call_args_list = _delegating_property('call_args_list')
@@ -579,6 +584,7 @@ class NonCallableMock(Base):
         visited.append(id(self))
 
         self.called = False
+        self.call_event = CallEvent(self)
         self.call_args = None
         self.call_count = 0
         self.mock_calls = _CallList()
@@ -1100,6 +1106,7 @@ class CallableMixin(Base):
     def _increment_mock_call(self, /, *args, **kwargs):
         self.called = True
         self.call_count += 1
+        self.call_event._notify()
 
         # handle call_args
         # needs to be set here so assertions on call arguments pass before
@@ -2394,6 +2401,73 @@ def _format_call_signature(name, args, kwargs):
 
     return message % formatted_args
 
+
+class CallEvent(object):
+    def __init__(self, mock):
+        self._mock = mock
+        self._condition = threading.Condition()
+
+    def wait(self, /, skip=0, timeout=None):
+        """
+        Wait for any call.
+
+        :param skip: How many calls will be skipped.
+                     As a result, the mock should be called at least
+                     ``skip + 1`` times.
+
+        :param timeout: See :meth:`threading.Condition.wait`.
+         """
+        def predicate(mock):
+            return mock.call_count > skip
+
+        self.wait_for(predicate, timeout=timeout)
+
+    def wait_for_call(self, call, /, skip=0, timeout=None):
+        """
+        Wait for a given call.
+
+        :param skip: How many calls will be skipped.
+                     As a result, the call should happen at least
+                     ``skip + 1`` times.
+
+        :param timeout: See :meth:`threading.Condition.wait`.
+        """
+        def predicate(mock):
+            return mock.call_args_list.count(call) > skip
+
+        self.wait_for(predicate, timeout=timeout)
+
+    def wait_for(self, predicate, /, timeout=None):
+        """
+        Wait for a given predicate to become True.
+
+        :param predicate: A callable that receives mock which result
+                          will be interpreted as a boolean value.
+                          The final predicate value is the return value.
+
+        :param timeout: See :meth:`threading.Condition.wait`.
+        """
+        try:
+            self._condition.acquire()
+
+            def _predicate():
+                return predicate(self._mock)
+
+            b = self._condition.wait_for(_predicate, timeout)
+
+            if not b:
+                msg = (f"{self._mock._mock_name or 'mock'} was not called before"
+                       f" timeout({timeout}).")
+                raise AssertionError(msg)
+        finally:
+            self._condition.release()
+
+    def _notify(self):
+        try:
+            self._condition.acquire()
+            self._condition.notify_all()
+        finally:
+            self._condition.release()
 
 
 class _Call(tuple):
